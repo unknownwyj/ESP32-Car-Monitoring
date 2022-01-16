@@ -5,7 +5,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_ADS1X15.h>
-Adafruit_ADS1015 ads;
+Adafruit_ADS1115 ads;
 #define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */ 
 #define TIME_TO_SLEEP 3 /* Time ESP32 will go to sleep (in seconds) */
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -19,6 +19,7 @@ float supercapmaxvoltage = 36;
 float supercap_adc_voltage = 0.0;
 float supercap_voltage = 0.0;
 float supercap_percentage = 0.0;
+float supercap_calibration = 1.003;
 
 float R1 = 340900.0;
 float R2 = 29770.0; 
@@ -34,7 +35,7 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   btStop();
   Serial.begin(9600);
-  ads.setGain(GAIN_TWOTHIRDS);
+  ads.setGain(GAIN_ONE);
   if (!ads.begin()) {
     Serial.println("Failed to initialize ADS.");}
   pinMode(ANALOG_IN_PIN, INPUT);
@@ -48,7 +49,7 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
   sensorRUN();
-  displayOLED(1);
+  displayOLED(0);
   esp_deep_sleep_start();
 }
 void sensorRUN(){/*
@@ -60,11 +61,14 @@ void sensorRUN(){/*
   supercap_voltage = supercap_adc_voltage / (R2/(R1+R2));
   supercap_percentage = supercap_voltage / supercapmaxvoltage; */
   int16_t results;
-  float multiplier = 0.1875F;
+  float multiplier = 0.125F;
   results = ads.readADC_SingleEnded(0);
-  supercap_adc_voltage = ads.computeVolts(results);
+  //supercap_adc_voltage = ads.computeVolts(results);
+  supercap_adc_voltage = ((results * multiplier)/1000)*supercap_calibration;
+  Serial.println(results);
+  Serial.println(supercap_adc_voltage,4);
   supercap_voltage = supercap_adc_voltage / (R2/(R1+R2));
-  supercap_voltage = supercap_voltage / supercapmaxvoltage;
+  supercap_percentage = supercap_voltage / supercapmaxvoltage;
 }
 void displayOLED(int modes){
   switch(modes){
@@ -77,7 +81,12 @@ void displayOLED(int modes){
       display.println("SuperCap Voltage:");
       display.setTextSize(3);
       display.setCursor (20, 30);
-      display.println(supercap_voltage, 3);
+      display.print(supercap_voltage, 2);
+      display.println("V");
+      display.setTextSize(1);
+      display.print("SoC:");
+      display.print(supercap_percentage*100, 2);
+      display.print("%");
       display.display(); 
       break;
     case 1:
