@@ -10,20 +10,27 @@
 #include <TinyGPS++.h>
 #include <ESP32Time.h>
 #define time_offset 28800 // UTC+8
+#define forcecarstarted
+#define SPI_MOSI 23
+#define SPI_MISO 19
+#define SPI_SCK 18
+#define SD_CS 15 // SD Adapter
 ESP32Time rtc;
-#define LOG_to_SD
+//#define LOG_to_SD
 #ifdef LOG_to_SD
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
 #endif
 #define DELAYTIMER 1 // 1 second delay
+bool ChangedModecleardisplaycheck = true;
 struct Button {
   const uint8_t PIN;
   bool pressed;
 };
 Button button1 = {33,false};
 //gps stuff
+struct tm timeinfo;
 static const uint32_t GPSBaud = 9600;
 #define RXD2 16
 #define TXD2 17
@@ -44,7 +51,7 @@ int modes=0;
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET,800000U,100000U);
 
 float supercapmaxvoltage = 36;
 
@@ -71,15 +78,17 @@ float RRR1 = 325400.0;
 float RRR2 = 99200.0;
 float carstartedref_voltage = 12.0;
 float ref_voltage = 3.3;
-bool Car_started = false;
+bool Car_started = true;
 int64_t last_time = 0;
 int64_t current_time = 0;
+int64_t Timerforbutton = 0;
 int adc_value = 0;
 void sensorRUN();
 void displayOLED(int modes);
 void wakeupreason();
 int GPSTime();
 void gpsRUN(void *pvParameters);
+void drawCentreString(const String &buf, int x, int y);
 #ifdef LOG_to_SD
 void loggingtoSD();
 #endif
@@ -90,7 +99,11 @@ void printAddress(DeviceAddress deviceAddress) {
   }
 }
 void IRAM_ATTR isr() {
-  button1.pressed = true;
+  uint64_t now = esp_timer_get_time();
+  if(now - Timerforbutton > 1000000) {
+    button1.pressed = true;
+    Timerforbutton = esp_timer_get_time();
+  }
 }
 void setup() {
   pinMode(button1.PIN, INPUT);
@@ -99,8 +112,9 @@ void setup() {
   attachInterrupt(button1.PIN, isr, FALLING);
   setCpuFrequencyMhz(240);
   WiFi.mode(WIFI_OFF);
+  pinMode(SD_CS, OUTPUT);
   btStop();
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   ads.setGain(GAIN_ONE);
   if (!ads.begin(0x48)) {
@@ -109,7 +123,9 @@ void setup() {
     Serial.println(F("SSD1306 allocation failed"));
   }
   #ifdef LOG_to_SD
-  if(!SD.begin()){
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+  delay(1000);
+  if(!SD.begin(SD_CS, SPI, 4000000)){
   Serial.println("Card Mount Failed");
   return;
   }
@@ -146,6 +162,7 @@ void setup() {
     }
   } */
   xTaskCreatePinnedToCore(gpsRUN,"trackgps",10000,NULL,5,&gpstask,0);
+  /*
   display.clearDisplay();
   display.setTextSize(1);
   display.println("Starting...");
@@ -160,7 +177,7 @@ void setup() {
       display.println("GPS Found");
       display.display();
       int time = GPSTime();
-      if (time = 0){
+      if (time == 0){
         display.clearDisplay();
         display.setTextSize(1);
         display.println("GPS Time 0 Error");
@@ -173,7 +190,7 @@ void setup() {
       break;
     }
     vTaskDelay(1000);
-  }
+  }*/
 }
 void gpsRUN(void *pvParameters) {
   while(1){
@@ -184,16 +201,33 @@ void gpsRUN(void *pvParameters) {
       }
     }
     vTaskDelay(1);
+    getLocalTime(&timeinfo);
   }
 }
 void loop() {
   // put your main code here, to run repeatedly:
+   if (button1.pressed) {
+    Serial.println("Button Pressed");
+    button1.pressed = false;
+    ChangedModecleardisplaycheck = true;
+    modes++;
+    if(modes>=4){
+      modes=0;
+    }
+    displayOLED(modes);
+    last_time = esp_timer_get_time();
+  }
   if(!Car_started){
     wakeupreason();
     sensorRUN();
     displayOLED(modes);
+    int i = 0;
     while(!gpsupdated){
       Serial.println("waiting for gps");
+      i++;
+      if(i > 50){
+        gpsupdated = true; 
+      }
       vTaskDelay(100);
     }
     gpsupdated = false;
@@ -203,20 +237,16 @@ void loop() {
     esp_light_sleep_start();
   }
   else{
-    if((esp_timer_get_time() - last_time)/1000000 > DELAYTIMER){
+    if((esp_timer_get_time() - last_time)/500000 > DELAYTIMER){
+      Serial.print("Time Used:");
       last_time = esp_timer_get_time();
       sensorRUN();
       displayOLED(modes);
       #ifdef LOG_to_SD
+      Serial.print("|loggingtoSD = ");
       loggingtoSD();
       #endif
-    }
-  }
-  if (button1.pressed) {
-    button1.pressed = false;
-    modes++;
-    if(modes>=3){
-      modes=0;
+      Serial.println(esp_timer_get_time() - last_time);
     }
   }
 }
@@ -256,8 +286,8 @@ void sensorRUN(){
   supercap_adc_voltage = ((results[0] * multiplier)/1000)*supercap_calibration;
   battery_adc_voltage = ((results[1] * multiplier)/1000)*battery_calibration;
   accdect_adc_voltage = ((results[2] * multiplier)/1000)*accdect_calibration;
-  Serial.println(results[0]);
-  Serial.println(supercap_adc_voltage,4);
+  //Serial.println(results[0]);
+  //Serial.println(supercap_adc_voltage,4);
   supercap_voltage = supercap_adc_voltage / (R2/(R1+R2));
   battery_voltage = battery_adc_voltage / (RR2/(RR1+RR2));
   supercap_percentage = supercap_voltage / supercapmaxvoltage;
@@ -267,6 +297,9 @@ void sensorRUN(){
   }
   else{
     Car_started = false;
+    #ifdef forcecarstarted
+    Car_started = true;
+    #endif
   }
   //temperature
   /*
@@ -287,20 +320,31 @@ void sensorRUN(){
   }*/
 }
 void displayOLED(int modes){
+  if(ChangedModecleardisplaycheck){
+      ChangedModecleardisplaycheck = false;
+      display.clearDisplay();
+    }
   switch(modes){
     case 0:
-      display.clearDisplay();
       display.setTextSize(1);
-      display.setTextColor(WHITE);
-      display.setCursor(0, 10);
+      display.setTextColor(WHITE,BLACK);
+      display.setCursor(40,0);
+      display.print(&timeinfo,"%H:%M:%S");
+      display.setCursor(0, 15);
       // Display static text
       display.println("SuperCap Voltage:");
       display.setTextSize(3);
-      display.setCursor (20, 30);
+      display.setCursor (12, 30);
+      if(supercap_voltage < 10){
+        display.print("0");
+      }
       display.print(supercap_voltage, 2);
       display.println("V");
       display.setTextSize(1);
       display.print("SoC:");
+      if(supercap_percentage*100 < 10){
+        display.print("0");
+      }
       display.print(supercap_percentage*100, 2);
       display.print("%");
       display.display(); 
@@ -308,12 +352,17 @@ void displayOLED(int modes){
     case 1:
       display.clearDisplay();
       display.setTextSize(1);
-      display.setTextColor(WHITE);
-      display.setCursor(0, 10);
+      display.setTextColor(WHITE,BLACK);
+      display.setCursor(40,0);
+      display.print(&timeinfo,"%H:%M:%S");
+      display.setCursor(0, 15);
       // Display static text
       display.println("Battery Voltage:");
       display.setTextSize(3);
-      display.setCursor (20, 30);
+      display.setCursor (12, 30);
+      if(battery_voltage < 10){
+        display.print("0");
+      }
       display.print(battery_voltage, 2);
       display.println("V");
       display.display(); 
@@ -321,34 +370,52 @@ void displayOLED(int modes){
     case 2:
       display.clearDisplay();
       display.setTextSize(1);
-      display.setTextColor(WHITE);
-      display.setCursor(0, 10);
+      display.setTextColor(WHITE,BLACK);
+      display.setCursor(0, 0);
       // Display static text
       display.println("Temperature:");
       display.println("SuperCap:");
       display.setTextSize(2);
       display.print(tempC[0], 2);
-      display.println("°C");
+      display.print((char)247);display.println("C");
       display.setTextSize(1);
-      display.print("Lithium Battery:");
+      display.println("Lithium Battery:");
       display.setTextSize(2);
       display.print(tempC[1], 2);
-      display.println("°C");
-      display.setTextSize(1);
+      display.print((char)247);display.println("C");
       display.display(); 
       break;
     case 3:
-      display.clearDisplay();
+      display.setCursor(0,0);
       display.setTextSize(1);
-      display.setTextColor(WHITE);
-      display.println(rtc.getTime());
-      display.setTextSize(2);
-      display.print(gps.speed.kmph(), 2);
+      display.setTextColor(WHITE,BLACK);
+      display.print("Time:");
+      display.setCursor(40,0);
+      display.println(&timeinfo,"%H:%M:%S");
+      display.setTextSize(4);
+      display.fillRect(3,11,99,33,BLACK);
+      char s[10];
+      sprintf(s,"%.0f", gps.speed.kmph());
+      drawCentreString(s,64,12);
+      display.setCursor(100,30);
       display.setTextSize(1);
       display.println("km/h");
-      display.print(gps.satellites.value());
+      display.setCursor(0,45);
+      if(gps.satellites.value() > 9){
+        display.print(gps.satellites.value());
+      }
+      else{
+        display.print(gps.satellites.value());
+        display.print(" ");
+      }
       display.println("-Sats connected");
-      display.print(gps.hdop.value());
+      if(gps.hdop.value() > 9){
+        display.print(gps.hdop.value());
+      }
+      else{
+        display.print(gps.hdop.value());
+        display.print(" ");
+      }
       display.println("-HDOP");
       display.display();
   }
@@ -398,4 +465,14 @@ int GPSTime() {
     else{
       return 0;
     }
+}
+void drawCentreString(const String &buf, int x, int y)
+{
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(buf, x, y, &x1, &y1, &w, &h); //calc width of new string
+    Serial.printf("x:%d, y:%d, w:%d, h:%d", x1, y1, w, h);
+    Serial.print("\n");
+    display.setCursor(x - w / 2, y);
+    display.print(buf);
 }
