@@ -1,39 +1,40 @@
+//#define useSSD1327
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Adafruit_ADS1X15.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <TinyGPS++.h>
 #include <ESP32Time.h>
+#include <Adafruit_SSD1327.h>
+
 #define time_offset 28800 // UTC+8
 #define forcecarstarted
-#define SPI_MOSI 23
-#define SPI_MISO 19
-#define SPI_SCK 18
-#define SD_CS 15 // SD Adapter
+#define longpress_time 20000000 // 2s
+#define shortpressdelay 200000 // 0.2s
 ESP32Time rtc;
 //#define LOG_to_SD
 #ifdef LOG_to_SD
 #include "FS.h"
-#include "SD.h"
-#include "SPI.h"
+#include "SD_MMC.h"
+File Sensorsfile;
 #endif
 #define DELAYTIMER 1 // 1 second delay
 bool ChangedModecleardisplaycheck = true;
 struct Button {
   const uint8_t PIN;
   bool pressed;
+  bool longpressed;
 };
-Button button1 = {33,false};
+Button button1 = {33,false,false};
 //gps stuff
 struct tm timeinfo;
 static const uint32_t GPSBaud = 9600;
-#define RXD2 16
-#define TXD2 17
+#define RXD2 25
+#define TXD2 26
 TinyGPSPlus gps;
 TaskHandle_t gpstask;
 bool gpsupdated = false;
@@ -48,10 +49,12 @@ Adafruit_ADS1115 ads;
 #define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */ 
 #define TIME_TO_SLEEP 3 /* Time ESP32 will go to sleep (in seconds) */
 int modes=0;
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET,800000U,100000U);
+#define OLED_MOSI   23
+#define OLED_CLK    18
+#define OLED_DC     16
+#define OLED_CS     5
+#define OLED_RESET  17
+Adafruit_SSD1327 display(128, 128, &SPI, OLED_DC, OLED_RESET, OLED_CS, 10000000UL);
 
 float supercapmaxvoltage = 36;
 
@@ -79,6 +82,8 @@ float RRR2 = 99200.0;
 float carstartedref_voltage = 12.0;
 float ref_voltage = 3.3;
 bool Car_started = true;
+bool SDcard_mounted = false;
+
 int64_t last_time = 0;
 int64_t current_time = 0;
 int64_t Timerforbutton = 0;
@@ -100,7 +105,7 @@ void printAddress(DeviceAddress deviceAddress) {
 }
 void IRAM_ATTR isr() {
   uint64_t now = esp_timer_get_time();
-  if(now - Timerforbutton > 1000000) {
+  if(now - Timerforbutton > 500000) {
     button1.pressed = true;
     Timerforbutton = esp_timer_get_time();
   }
@@ -112,34 +117,33 @@ void setup() {
   attachInterrupt(button1.PIN, isr, FALLING);
   setCpuFrequencyMhz(240);
   WiFi.mode(WIFI_OFF);
-  pinMode(SD_CS, OUTPUT);
   btStop();
+  
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  if (!display.begin()) {
+     Serial.println("Unable to initialize OLED");
+  }
+  display.clearDisplay();
+  display.display();
   ads.setGain(GAIN_ONE);
   if (!ads.begin(0x48)) {
     Serial.println("Failed to initialize ADS.");}
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
-    Serial.println(F("SSD1306 allocation failed"));
-  }
+  //if failed will cause esp32 to stuck 
   #ifdef LOG_to_SD
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
-  delay(1000);
-  if(!SD.begin(SD_CS, SPI, 4000000)){
-  Serial.println("Card Mount Failed");
-  return;
+  if (!SD_MMC.begin("/sd", true)) {
+    Serial.println("Card Mount Failed");
   }
   else{
   Serial.println("Card Mounted");
-  if (!SD.exists("/SensorData.txt")){
+  SDcard_mounted = true;
+  if (!SD_MMC.exists("/SensorData.txt")){
     Serial.println("File doesn't exist creating new file");
-    File dataFile = SD.open("/SensorData.txt", FILE_WRITE);
+    File dataFile = SD_MMC.open("/SensorData.txt", FILE_WRITE);
     dataFile.close();
   }
   }
   #endif
-  display.clearDisplay();
-  display.dim(true);
   /*
   sensors.begin();
   numberOfDevices = sensors.getDeviceCount();
@@ -162,35 +166,6 @@ void setup() {
     }
   } */
   xTaskCreatePinnedToCore(gpsRUN,"trackgps",10000,NULL,5,&gpstask,0);
-  /*
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.println("Starting...");
-  display.display();
-  display.print("Waiting for GPS");
-  for(int i = 0; i < 10; i++){
-    display.print(".");
-    display.display();
-    if(gps.time.isUpdated()){
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.println("GPS Found");
-      display.display();
-      int time = GPSTime();
-      if (time == 0){
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.println("GPS Time 0 Error");
-        display.display();
-      }
-      else{
-        rtc.setTime(time+time_offset);
-        i = 20;
-      }
-      break;
-    }
-    vTaskDelay(1000);
-  }*/
 }
 void gpsRUN(void *pvParameters) {
   while(1){
@@ -217,6 +192,28 @@ void loop() {
     displayOLED(modes);
     last_time = esp_timer_get_time();
   }
+    if(button1.longpressed){
+      Serial.println("Button Long Pressed");
+      button1.longpressed = false;
+      ChangedModecleardisplaycheck = true;
+      //sdcard check 
+      #ifdef LOG_to_SD
+      if (!SDcard_mounted){
+        if (!SD_MMC.begin("/sd", true)) {
+        Serial.println("Card Mount Failed");
+       return;
+       } 
+      else{
+      Serial.println("Card Mounted");
+      SDcard_mounted = true;
+      }
+      }
+      else if (SDcard_mounted){
+      SD_MMC.end();
+      SDcard_mounted = false;
+    }
+    #endif
+  }
   if(!Car_started){
     wakeupreason();
     sensorRUN();
@@ -232,20 +229,29 @@ void loop() {
     }
     gpsupdated = false;
     #ifdef LOG_to_SD
-    loggingtoSD();
+    if(SDcard_mounted){
+      loggingtoSD();
+      //maybe add a sdcard mount check ?
+    }
     #endif
     esp_light_sleep_start();
   }
   else{
     if((esp_timer_get_time() - last_time)/500000 > DELAYTIMER){
-      Serial.print("Time Used:");
       last_time = esp_timer_get_time();
       sensorRUN();
       displayOLED(modes);
       #ifdef LOG_to_SD
-      Serial.print("|loggingtoSD = ");
-      loggingtoSD();
+      if(SDcard_mounted){
+        Serial.print("loggingtoSD");
+        loggingtoSD();
+        //maybe add a sdcard mount check ?
+      }
+      else{
+        Serial.println("SDcard not mounted");
+      }
       #endif
+      Serial.print("Time Used:");
       Serial.println(esp_timer_get_time() - last_time);
     }
   }
@@ -327,7 +333,7 @@ void displayOLED(int modes){
   switch(modes){
     case 0:
       display.setTextSize(1);
-      display.setTextColor(WHITE,BLACK);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.setCursor(40,0);
       display.print(&timeinfo,"%H:%M:%S");
       display.setCursor(0, 15);
@@ -346,13 +352,33 @@ void displayOLED(int modes){
         display.print("0");
       }
       display.print(supercap_percentage*100, 2);
-      display.print("%");
+      display.println("%");
+      display.setTextSize(1);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+      display.setCursor(0, display.getCursorY()+9);
+      display.println("Battery Voltage:");
+      display.setTextSize(3);
+      display.setCursor (12, display.getCursorY()+5);
+      if(battery_voltage < 10){
+        display.print("0");
+      }
+      display.print(battery_voltage, 2);
+      display.println("V");
+      display.setTextSize(1);
+      display.setCursor(0, display.getCursorY()+5);
+      display.print("SD Status:");
+      if(!SDcard_mounted){
+        display.println("error");
+      }
+      else{
+        display.println("mounted");
+      }
       display.display(); 
       break;
     case 1:
       display.clearDisplay();
       display.setTextSize(1);
-      display.setTextColor(WHITE,BLACK);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.setCursor(40,0);
       display.print(&timeinfo,"%H:%M:%S");
       display.setCursor(0, 15);
@@ -365,12 +391,19 @@ void displayOLED(int modes){
       }
       display.print(battery_voltage, 2);
       display.println("V");
+      display.setTextSize(1);
+      if(!SDcard_mounted){
+        display.print("error");
+      }
+      else{
+        display.print("mounted");
+      }
       display.display(); 
       break; 
     case 2:
       display.clearDisplay();
       display.setTextSize(1);
-      display.setTextColor(WHITE,BLACK);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.setCursor(0, 0);
       // Display static text
       display.println("Temperature:");
@@ -388,12 +421,12 @@ void displayOLED(int modes){
     case 3:
       display.setCursor(0,0);
       display.setTextSize(1);
-      display.setTextColor(WHITE,BLACK);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.print("Time:");
       display.setCursor(40,0);
       display.println(&timeinfo,"%H:%M:%S");
-      display.setTextSize(4);
-      display.fillRect(3,11,99,33,BLACK);
+      display.setTextSize(5);
+      display.fillRect(3,11,99,33,SSD1327_BLACK);
       char s[10];
       sprintf(s,"%.0f", gps.speed.kmph());
       drawCentreString(s,64,12);
@@ -418,33 +451,59 @@ void displayOLED(int modes){
       }
       display.println("-HDOP");
       display.display();
+      break;
+    case 4:
+      display.setCursor(0,0);
+      display.setTextSize(1);
+      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+      display.println("Settings:");
+      display.print("SDcard Status:");
+      if(!SDcard_mounted){
+        display.println("Not Mounted");
+      }
+      else{
+        display.println("Mounted");
+      }
   }
 }
 #ifdef LOG_to_SD
 void loggingtoSD(){
-  char message[100] = "";
-  dtostrf (supercap_voltage, 4, 2, message);
+  char message[400]="";
+  char buffer[5][40] = {"","","","",""};
+  dtostrf (supercap_voltage, 4, 2, buffer[0]);
+  dtostrf (battery_voltage, 4, 2, buffer[1]);
+  dtostrf (tempC[0], 4, 2, buffer[2]);
+  dtostrf (tempC[1], 4, 2, buffer[3]);
+  //char currenttime[100];
+  //sprintf(currenttime, "%d", esp_timer_get_time()/1000000);
+  //strcat(message, currenttime);
+  //strcat(message, rtc.getTime().c_str());
+  strcat(message, buffer[0]);
   strcat(message, ",");
-  dtostrf (battery_voltage, 4, 2, message);
+  strcat(message, buffer[1]);
   strcat(message, ",");
-  dtostrf (tempC[0], 4, 2, message);
+  strcat(message, buffer[2]);
   strcat(message, ",");
-  dtostrf (tempC[1], 4, 2, message);
-  strcat(message, ",");
-  char currenttime[100];
-  sprintf(currenttime, "%d", esp_timer_get_time()/1000000);
-  strcat(message, currenttime);
+  strcat(message, buffer[3]);
   strcat(message, ",");
   strcat(message, rtc.getTime().c_str());
-  strcat(message, 0); //terminate correctly 
-  File file = SD.open("/SensorData.txt", FILE_APPEND);
-  if(file.println(message)){
-    Serial.println("Logging to SD");
+  if(Sensorsfile.available()){
+    Sensorsfile.println(message);
+  }
+  else{
+    Sensorsfile = SD_MMC.open("/SensorData.txt", FILE_APPEND);
+    Sensorsfile.println(message);
+    Sensorsfile.flush();
+  }
+  /*
+  File file = SD_MMC.open("/SensorData.txt", FILE_APPEND);
+  if(Sensorsfile.println(message)){
+    Serial.println("Logged to SD");
   }
   else{
     Serial.println("Failed to log to SD");
   }
-  file.close();
+  file.close(); */
 }
 #endif
 
