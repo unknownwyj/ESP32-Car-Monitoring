@@ -15,7 +15,7 @@
 #define forcecarstarted
 #define longpress_time 20000000 // 2s
 #define shortpressdelay 200000 // 0.2s
-ESP32Time rtc;
+time_t t_of_day; // time of day
 //#define LOG_to_SD
 #ifdef LOG_to_SD
 #include "FS.h"
@@ -91,7 +91,7 @@ int adc_value = 0;
 void sensorRUN();
 void displayOLED(int modes);
 void wakeupreason();
-int GPSTime();
+void updateGPSTime();
 void gpsRUN(void *pvParameters);
 void drawCentreString(const String &buf, int x, int y);
 #ifdef LOG_to_SD
@@ -176,6 +176,7 @@ void gpsRUN(void *pvParameters) {
       }
     }
     vTaskDelay(1);
+    updateGPSTime();
     getLocalTime(&timeinfo);
   }
 }
@@ -227,6 +228,7 @@ void loop() {
       }
       vTaskDelay(100);
     }
+    
     gpsupdated = false;
     #ifdef LOG_to_SD
     if(SDcard_mounted){
@@ -507,22 +509,16 @@ void loggingtoSD(){
 }
 #endif
 
-int GPSTime() {
-    time_t t_of_day; 
-    struct tm t;
+void updateGPSTime() {
     if (gps.date.isUpdated())
     {
-    t.tm_year = gps.date.year()-1900;
-    t.tm_mon = gps.date.month()-1;           // Month, 0 - jan
-    t.tm_mday = gps.date.day();          // Day of the month
-    t.tm_hour = gps.time.hour();
-    t.tm_min =  gps.time.minute();
-    t.tm_sec = gps.time.second();
-    t_of_day = mktime(&t);
-    return t_of_day;
-    }
-    else{
-      return 0;
+    timeinfo.tm_year = gps.date.year()-1900;
+    timeinfo.tm_mon = gps.date.month()-1;           // Month, 0 - jan
+    timeinfo.tm_mday = gps.date.day();          // Day of the month
+    timeinfo.tm_hour = gps.time.hour();
+    timeinfo.tm_min =  gps.time.minute();
+    timeinfo.tm_sec = gps.time.second();
+    t_of_day = mktime(&timeinfo);
     }
 }
 void drawCentreString(const String &buf, int x, int y)
