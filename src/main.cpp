@@ -10,11 +10,19 @@
 #include <TinyGPS++.h>
 #include <ESP32Time.h>
 #include <Adafruit_SSD1327.h>
+#include <Adafruit_AHTX0.h>
 // ELM327
 #include <BluetoothSerial.h>
 #include <ELMduino.h>
-#include <atomic>
-
+void connect_to_obd();
+ELM327 obd;
+BluetoothSerial SerialBT;
+TaskHandle_t rpm_task;
+int64_t last_time_obd = 0;
+float rpm = 0;
+int error_count = 0;
+bool connected_to_obd = false;
+#define rpm_interval 500000
 #define time_offset 28800 // UTC+8
 #define forcecarstarted
 #define longpress_time 20000000 // 2s
@@ -40,9 +48,10 @@ struct OldCords {
     uint16_t  wo;
     uint16_t  ho;
 };
-OldCords speedo,sats;
+OldCords speedo,sats,hdop;
 Button button1 = {33,false,false,0};
 Button button2 = {34,false,false,0};
+Button button3 = {35,false,false,0};
 //gps stuff
 struct tm timeinfo;
 static const uint32_t GPSBaud = 9600;
@@ -57,6 +66,9 @@ DallasTemperature sensors(&oneWire);
 DeviceAddress tempDeviceAddress; 
 int numberOfDevices;
 float tempC[10];
+Adafruit_AHTX0 aht;
+bool aht_connected = false;
+sensors_event_t ahthumidity, ahttemp;
 
 Adafruit_ADS1115 ads;
 #define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */ 
@@ -110,37 +122,55 @@ struct OldCords printlnnclearoldtext(Adafruit_SSD1327 &displayd, const char *tex
 #ifdef LOG_to_SD
 void loggingtoSD();
 #endif
+void get_rpm_task(void* parameters)
+{
+  for (;;)
+    {
+      int64_t current_time_obd = esp_timer_get_time();
+      if (current_time_obd - last_time_obd >= rpm_interval)
+      {
+        rpm = obd.rpm();
+        Serial.print("RPM: "); Serial.println(rpm);
+        last_time_obd = current_time_obd;
+      if (obd.nb_rx_state != ELM_GETTING_MSG && obd.nb_rx_state != ELM_SUCCESS)
+      {
+        obd.printError();
+      }
+      }
+      delay(1);
+    }
+}
 void printAddress(DeviceAddress deviceAddress) {
   for (uint8_t i = 0; i < 8; i++){
     if (deviceAddress[i] < 16) Serial.print("0");
       Serial.print(deviceAddress[i], HEX);
   }
 }
-void IRAM_ATTR isr() {
+void button_loop() {
   uint64_t now = esp_timer_get_time();
-  if(now - button1.timer > 500000) {
+  if(now - button1.timer > 500000 && digitalRead(button1.PIN) == LOW) {
     button1.pressed = true;
     button1.timer = esp_timer_get_time();
   }
-}
-void IRAM_ATTR isr1() {
-  uint64_t now = esp_timer_get_time();
-  if(now - button2.timer > 500000) {
+  if(now - button2.timer > 500000 && digitalRead(button2.PIN) == LOW) {
     button2.pressed = true;
     button2.timer = esp_timer_get_time();
+  }
+  if(now - button3.timer > 500000 && digitalRead(button3.PIN) == LOW) {
+    button3.pressed = true;
+    button3.timer = esp_timer_get_time();
   }
 }
 void setup() {
   pinMode(button1.PIN, INPUT);
   pinMode(button2.PIN, INPUT);
+  pinMode(button3.PIN, INPUT);
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_33,1);
-  attachInterrupt(button1.PIN, isr, FALLING);
-  attachInterrupt(button1.PIN, isr1, FALLING);
+  //esp_sleep_enable_ext1_wakeup(GPIO_NUM_34,1);
   setCpuFrequencyMhz(240);
   WiFi.mode(WIFI_OFF);
   btStop();
-  
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   if (!display.begin()) {
@@ -159,21 +189,21 @@ void setup() {
   else{
   Serial.println("Card Mounted");
   SDcard_mounted = true;
-  File dataFile = SD_MMC.open("/SensorData.txt");
-  if(!dataFile){
+  if (!SD_MMC.exists("/SensorData.txt")){
     Serial.println("File doesn't exist creating new file");
-    File file = SD_MMC.open("/SensorData.txt", FILE_WRITE);
-    if(!file){
-        Serial.println("Failed to open file for writing");
-        return;
-    }
-    file.close();
-  }
-  else{
+    File dataFile = SD_MMC.open("/SensorData.txt", FILE_WRITE);
     dataFile.close();
   }
   }
   #endif
+  if(aht.begin()){
+    aht_connected = true;
+    Serial.println("AHT connected");
+  }
+  else{
+    aht_connected = false;
+    Serial.println("AHT not connected");
+  }
   /*
   sensors.begin();
   numberOfDevices = sensors.getDeviceCount();
@@ -211,6 +241,7 @@ void gpsRUN(void *pvParameters) {
 }
 void loop() {
   // put your main code here, to run repeatedly:
+   button_loop();
    if (button1.pressed) {
     Serial.println("Button Pressed");
     button1.pressed = false;
@@ -239,8 +270,8 @@ void loop() {
       }
       }
       else if (SDcard_mounted){
-      SD_MMC.end();
-      SDcard_mounted = false;
+      //SD_MMC.end();
+      //SDcard_mounted = false;
     }
     #endif
   }
@@ -262,7 +293,6 @@ void loop() {
     #ifdef LOG_to_SD
     if(SDcard_mounted){
       loggingtoSD();
-      //maybe add a sdcard mount check ?
     }
     #endif
     esp_light_sleep_start();
@@ -294,7 +324,7 @@ void wakeupreason(){
   {
     case ESP_SLEEP_WAKEUP_EXT0:
       Serial.println("Wakeup caused by external signal using RTC_IO");
-      if (modes <= 1) modes++;
+      if (modes <= 4) modes++;
       else modes = 0;
       break;
     case ESP_SLEEP_WAKEUP_EXT1:
@@ -338,6 +368,9 @@ void sensorRUN(){
     Car_started = true;
     #endif
   }
+  if(aht_connected){
+    aht.getEvent(&ahthumidity,&ahttemp);
+  }
   //temperature
   /*
   sensors.requestTemperatures(); 
@@ -363,10 +396,12 @@ void displayOLED(int modes){
     }
   switch(modes){
     case 0:
+      display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.setCursor(40,0);
       display.print(&timeinfo,"%H:%M:%S");
+      display.drawLine(0,10,127,10,SSD1327_WHITE);
       display.setCursor(0, 15);
       // Display static text
       display.println("SuperCap Voltage:");
@@ -386,6 +421,7 @@ void displayOLED(int modes){
       display.println("%");
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+      display.drawLine(0, display.getCursorY(), 128, display.getCursorY(), SSD1327_WHITE);
       display.setCursor(0, display.getCursorY()+9);
       display.println("Battery Voltage:");
       display.setTextSize(3);
@@ -399,7 +435,7 @@ void displayOLED(int modes){
       display.setCursor(0, display.getCursorY()+5);
       display.print("SD Status:");
       if(!SDcard_mounted){
-        display.println("error");
+        display.println("X");
       }
       else{
         display.println("mounted");
@@ -407,55 +443,48 @@ void displayOLED(int modes){
       display.display(); 
       break;
     case 1:
-      display.clearDisplay();
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+    display.setCursor(0, 0);
+    // Display static text
+    display.println("Temperature:");
+    display.println("SuperCap:");
+    display.setTextSize(2);
+    display.print(tempC[0], 2);
+    display.print((char)247);display.println("C");
+    display.setTextSize(1);
+    display.println("Lithium Battery:");
+    display.setTextSize(2);
+    display.print(tempC[1], 2);
+    display.print((char)247);display.println("C");
+    if(aht_connected){
+      display.drawLine(0, display.getCursorY(), 128, display.getCursorY(), SSD1327_WHITE);
       display.setTextSize(1);
-      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
-      display.setCursor(40,0);
-      display.print(&timeinfo,"%H:%M:%S");
-      display.setCursor(0, 15);
-      // Display static text
-      display.println("Battery Voltage:");
-      display.setTextSize(3);
-      display.setCursor (12, 30);
-      if(battery_voltage < 10){
-        display.print("0");
-      }
-      display.print(battery_voltage, 2);
-      display.println("V");
-      display.setTextSize(1);
-      if(!SDcard_mounted){
-        display.print("error");
-      }
-      else{
-        display.print("mounted");
-      }
-      display.display(); 
-      break; 
-    case 2:
-      display.setTextSize(1);
-      display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
-      display.setCursor(0, 0);
-      // Display static text
+      display.setCursor(0, display.getCursorY()+5);
+      display.println("AHT20 Sensor");
       display.println("Temperature:");
-      display.println("SuperCap:");
       display.setTextSize(2);
-      display.print(tempC[0], 2);
+      display.print(ahttemp.temperature, 2);
       display.print((char)247);display.println("C");
+      display.setCursor(0, display.getCursorY()+1);
       display.setTextSize(1);
-      display.println("Lithium Battery:");
+      display.println("Humidity:");
       display.setTextSize(2);
-      display.print(tempC[1], 2);
-      display.print((char)247);display.println("C");
-      display.display(); 
-      break;
-    case 3:
+      display.print(ahthumidity.relative_humidity, 2);
+      display.println("RH%");
+    }
+    display.display(); 
+    break;
+    case 2:
       display.clearDisplay();
-      display.setCursor(0,0);
+      display.setCursor(3,0);
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.print("Time:");
       display.setCursor(40,0);
       display.println(&timeinfo,"%H:%M:%S");
+      display.drawLine(0,10,127,10,SSD1327_WHITE);
       display.setTextSize(5);
       char s[10];
       sprintf(s,"%.0f", gps.speed.kmph());
@@ -466,54 +495,70 @@ void displayOLED(int modes){
       display.println("km/h");
       display.setCursor(0,60);
       char s2[40];
+      char s3[40];
       sprintf(s2,"%u - Sats connected", gps.satellites.value());
       sats = printlnnclearoldtext(display,s2,SSD1327_BLACK,sats);
-      /*
-      if(gps.satellites.value() > 9){
-        display.print(gps.satellites.value());
-      }
-      else{
-        display.print(gps.satellites.value());
-        display.print(" ");
-      }
-      display.println("-Sats connected");*/
-      if(gps.hdop.value() > 9){
-        display.print(gps.hdop.value());
-      }
-      else{
-        display.print(gps.hdop.value());
-        display.print(" ");
-      }
-      display.println("-HDOP");
+      sprintf(s3,"%u - Sats connected", gps.hdop.value());
+      hdop = printlnnclearoldtext(display,s3,SSD1327_BLACK,hdop);
       display.display();
       break;
-    case 4:
+    case 3:
+      display.clearDisplay();
       display.setCursor(0,0);
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
-      display.println("Settings:");
-      display.print("SDcard Status:");
-      if(!SDcard_mounted){
-        display.println("Not Mounted");
+      if(!rpm_task){
+        //Start Task
+        connect_to_obd();
+        if(connected_to_obd){
+        xTaskCreatePinnedToCore(
+        get_rpm_task, // Task function.
+        "Task1",      // Name of task.
+        10000,        // Stack size of task
+        NULL,         // Parameter of the task
+        0,            // Priority of the task
+        &rpm_task,    // Task handle to keep track of created task
+        0);           // Pin task to core 0
       }
-      else{
-        display.println("Mounted");
       }
+      else
+      {
+        display.print("RPM:");
+        display.println(rpm);
+      }
+    case 4:
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+    display.println("Settings:");
+    display.print("SDcard Status:");
+    if(!SDcard_mounted){
+      display.println("Not Mounted");
+    }
+    else{
+      display.println("Mounted");
+    }
   }
 }
 #ifdef LOG_to_SD
 void loggingtoSD(){
   uint64_t current_time = esp_timer_get_time();
-  char message[400]="";
-  char buffer[7][50] = {"","","","",""};
+  char message[600]="";
+  char buffer[10][50] = {"","","","",""};
   dtostrf (supercap_voltage, 4, 2, buffer[0]);
   dtostrf (battery_voltage, 4, 2, buffer[1]);
   dtostrf (tempC[0], 4, 2, buffer[2]);
   dtostrf (tempC[1], 4, 2, buffer[3]);
+  Serial.println("time");
   strftime(buffer[4], sizeof(buffer[4]), "%Y-%m-%d,%H:%M:%S", &timeinfo);
   dtostrf (gps.speed.kmph(), 4, 2, buffer[5]);
-  dtostrf (gps.location.lat(), 1, 15, buffer[6]);
-  dtostrf (gps.location.lng(), 1, 15, buffer[7]);
+  Serial.println(gps.speed.kmph());
+  Serial.println(gps.location.lat());
+  Serial.println(gps.location.lng());
+  dtostrf (gps.location.lat(), 14, 7, buffer[6]);
+  dtostrf (gps.location.lng(), 14, 7, buffer[7]);
+  
   //char currenttime[100];
   //sprintf(currenttime, "%d", esp_timer_get_time()/1000000);
   //strcat(message, currenttime);
@@ -533,12 +578,19 @@ void loggingtoSD(){
   strcat(message, buffer[6]);
   strcat(message, ",");
   strcat(message, buffer[7]);
+  if(aht_connected){
+    dtostrf (ahttemp.temperature, 6, 2, buffer[8]);
+    dtostrf (ahthumidity.relative_humidity, 6, 2, buffer[9]);
+    strcat(message, ",");
+    strcat(message, buffer[8]);
+    strcat(message, ",");
+    strcat(message, buffer[9]);
+  }
   Serial.print("Time USED: ");
   Serial.println(esp_timer_get_time() - current_time);
   if(Sensorsfile.available()){
     if(!Sensorsfile.println(message)){
       Serial.println("Failed to write to SD card");
-      
     }
   }
   else{
@@ -604,4 +656,53 @@ struct OldCords printlnnclearoldtext(Adafruit_SSD1327 &displayd, const char *tex
   displayd.setCursor(x1, y1);
   displayd.println(text);
   return r;
+}
+void connect_to_obd()
+{
+  display.setTextSize(2);
+  display.setCursor(0,0);
+  display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
+  display.println("Connecting\nto OBD");
+  display.display();
+  error_count = 0;
+  btStart();
+    SerialBT.begin("led_flasher", true);
+    bool connected = SerialBT.connect("OBDII");
+    if(connected)
+    {
+      Serial.println("Connected Succesfully!");
+    }
+    else
+    {
+      while(!SerialBT.connected(5000))
+        {
+          display.setTextSize(1);
+            Serial.println("Failed to connect. Make sure remote device is available and in range, then restart app.");
+            display.setCursor(0,50);
+            display.print("Failed to connect.\nMake sure remote\ndevice is available\nand in range,\nRetrying ");
+            display.println(error_count);
+            display.display();
+            error_count++;
+            if(error_count > 10)
+            {
+              Serial.println("Too many errors. Exiting");
+              display.println("Too many errors.\nExiting");
+              display.display();
+              delay(2000);
+              connected_to_obd = false;
+              modes = 0;
+              display.clearDisplay();
+              return;
+            }
+        }
+    }
+    while(!obd.begin(SerialBT, true, 2000))
+    {
+      Serial.println("Couldn't connect to OBD scanner");
+      display.setCursor(0,80);
+      display.println("Couldn't connect to OBD scanner");
+      display.display();
+    }
+    Serial.println("Connected to ELM327");
+    connected_to_obd = true;
 }
