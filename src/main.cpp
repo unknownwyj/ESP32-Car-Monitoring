@@ -10,13 +10,17 @@
 #include <TinyGPS++.h>
 #include <ESP32Time.h>
 #include <Adafruit_SSD1327.h>
+// ELM327
+#include <BluetoothSerial.h>
+#include <ELMduino.h>
+#include <atomic>
 
 #define time_offset 28800 // UTC+8
 #define forcecarstarted
 #define longpress_time 20000000 // 2s
 #define shortpressdelay 200000 // 0.2s
-time_t t_of_day; // time of day
-//#define LOG_to_SD
+ESP32Time rtc;
+#define LOG_to_SD
 #ifdef LOG_to_SD
 #include "FS.h"
 #include "SD_MMC.h"
@@ -28,8 +32,17 @@ struct Button {
   const uint8_t PIN;
   bool pressed;
   bool longpressed;
+  int64_t timer;
 };
-Button button1 = {33,false,false};
+struct OldCords {
+    int16_t  xo;
+    int16_t  yo;
+    uint16_t  wo;
+    uint16_t  ho;
+};
+OldCords speedo,sats;
+Button button1 = {33,false,false,0};
+Button button2 = {34,false,false,0};
 //gps stuff
 struct tm timeinfo;
 static const uint32_t GPSBaud = 9600;
@@ -86,14 +99,14 @@ bool SDcard_mounted = false;
 
 int64_t last_time = 0;
 int64_t current_time = 0;
-int64_t Timerforbutton = 0;
 int adc_value = 0;
 void sensorRUN();
 void displayOLED(int modes);
 void wakeupreason();
 void updateGPSTime();
 void gpsRUN(void *pvParameters);
-void drawCentreString(const String &buf, int x, int y);
+struct OldCords drawCentreString(const String &buf, int16_t x, int16_t y, OldCords old);
+struct OldCords printlnnclearoldtext(Adafruit_SSD1327 &displayd, const char *text,uint16_t bg, OldCords old);
 #ifdef LOG_to_SD
 void loggingtoSD();
 #endif
@@ -105,16 +118,25 @@ void printAddress(DeviceAddress deviceAddress) {
 }
 void IRAM_ATTR isr() {
   uint64_t now = esp_timer_get_time();
-  if(now - Timerforbutton > 500000) {
+  if(now - button1.timer > 500000) {
     button1.pressed = true;
-    Timerforbutton = esp_timer_get_time();
+    button1.timer = esp_timer_get_time();
+  }
+}
+void IRAM_ATTR isr1() {
+  uint64_t now = esp_timer_get_time();
+  if(now - button2.timer > 500000) {
+    button2.pressed = true;
+    button2.timer = esp_timer_get_time();
   }
 }
 void setup() {
   pinMode(button1.PIN, INPUT);
+  pinMode(button2.PIN, INPUT);
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_33,1);
   attachInterrupt(button1.PIN, isr, FALLING);
+  attachInterrupt(button1.PIN, isr1, FALLING);
   setCpuFrequencyMhz(240);
   WiFi.mode(WIFI_OFF);
   btStop();
@@ -137,9 +159,17 @@ void setup() {
   else{
   Serial.println("Card Mounted");
   SDcard_mounted = true;
-  if (!SD_MMC.exists("/SensorData.txt")){
+  File dataFile = SD_MMC.open("/SensorData.txt");
+  if(!dataFile){
     Serial.println("File doesn't exist creating new file");
-    File dataFile = SD_MMC.open("/SensorData.txt", FILE_WRITE);
+    File file = SD_MMC.open("/SensorData.txt", FILE_WRITE);
+    if(!file){
+        Serial.println("Failed to open file for writing");
+        return;
+    }
+    file.close();
+  }
+  else{
     dataFile.close();
   }
   }
@@ -173,11 +203,10 @@ void gpsRUN(void *pvParameters) {
       while(Serial2.available() > 0){
         gps.encode(Serial2.read());
         gpsupdated = true;
-      }
+      }   
     }
     vTaskDelay(1);
     updateGPSTime();
-    getLocalTime(&timeinfo);
   }
 }
 void loop() {
@@ -193,9 +222,9 @@ void loop() {
     displayOLED(modes);
     last_time = esp_timer_get_time();
   }
-    if(button1.longpressed){
-      Serial.println("Button Long Pressed");
-      button1.longpressed = false;
+    if(button2.pressed){
+      Serial.println("Button 2 Pressed");
+      button2.pressed = false;
       ChangedModecleardisplaycheck = true;
       //sdcard check 
       #ifdef LOG_to_SD
@@ -403,7 +432,6 @@ void displayOLED(int modes){
       display.display(); 
       break; 
     case 2:
-      display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
       display.setCursor(0, 0);
@@ -421,6 +449,7 @@ void displayOLED(int modes){
       display.display(); 
       break;
     case 3:
+      display.clearDisplay();
       display.setCursor(0,0);
       display.setTextSize(1);
       display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
@@ -428,14 +457,18 @@ void displayOLED(int modes){
       display.setCursor(40,0);
       display.println(&timeinfo,"%H:%M:%S");
       display.setTextSize(5);
-      display.fillRect(3,11,99,33,SSD1327_BLACK);
       char s[10];
       sprintf(s,"%.0f", gps.speed.kmph());
-      drawCentreString(s,64,12);
-      display.setCursor(100,30);
+      //sprintf(s,"%ld", random(0,200));
+      speedo = drawCentreString(s,55,20,speedo);
+      display.setCursor(103,45);
       display.setTextSize(1);
       display.println("km/h");
-      display.setCursor(0,45);
+      display.setCursor(0,60);
+      char s2[40];
+      sprintf(s2,"%u - Sats connected", gps.satellites.value());
+      sats = printlnnclearoldtext(display,s2,SSD1327_BLACK,sats);
+      /*
       if(gps.satellites.value() > 9){
         display.print(gps.satellites.value());
       }
@@ -443,7 +476,7 @@ void displayOLED(int modes){
         display.print(gps.satellites.value());
         display.print(" ");
       }
-      display.println("-Sats connected");
+      display.println("-Sats connected");*/
       if(gps.hdop.value() > 9){
         display.print(gps.hdop.value());
       }
@@ -470,12 +503,17 @@ void displayOLED(int modes){
 }
 #ifdef LOG_to_SD
 void loggingtoSD(){
+  uint64_t current_time = esp_timer_get_time();
   char message[400]="";
-  char buffer[5][40] = {"","","","",""};
+  char buffer[7][50] = {"","","","",""};
   dtostrf (supercap_voltage, 4, 2, buffer[0]);
   dtostrf (battery_voltage, 4, 2, buffer[1]);
   dtostrf (tempC[0], 4, 2, buffer[2]);
   dtostrf (tempC[1], 4, 2, buffer[3]);
+  strftime(buffer[4], sizeof(buffer[4]), "%Y-%m-%d,%H:%M:%S", &timeinfo);
+  dtostrf (gps.speed.kmph(), 4, 2, buffer[5]);
+  dtostrf (gps.location.lat(), 1, 15, buffer[6]);
+  dtostrf (gps.location.lng(), 1, 15, buffer[7]);
   //char currenttime[100];
   //sprintf(currenttime, "%d", esp_timer_get_time()/1000000);
   //strcat(message, currenttime);
@@ -488,9 +526,20 @@ void loggingtoSD(){
   strcat(message, ",");
   strcat(message, buffer[3]);
   strcat(message, ",");
-  strcat(message, rtc.getTime().c_str());
+  strcat(message, buffer[4]);
+  strcat(message, ",");
+  strcat(message, buffer[5]);
+  strcat(message, ",");
+  strcat(message, buffer[6]);
+  strcat(message, ",");
+  strcat(message, buffer[7]);
+  Serial.print("Time USED: ");
+  Serial.println(esp_timer_get_time() - current_time);
   if(Sensorsfile.available()){
-    Sensorsfile.println(message);
+    if(!Sensorsfile.println(message)){
+      Serial.println("Failed to write to SD card");
+      
+    }
   }
   else{
     Sensorsfile = SD_MMC.open("/SensorData.txt", FILE_APPEND);
@@ -510,24 +559,49 @@ void loggingtoSD(){
 #endif
 
 void updateGPSTime() {
-    if (gps.date.isUpdated())
+  if(gps.satellites.value() > 0){
+    if (gps.time.isValid() || gps.date.isValid())
     {
-    timeinfo.tm_year = gps.date.year()-1900;
-    timeinfo.tm_mon = gps.date.month()-1;           // Month, 0 - jan
-    timeinfo.tm_mday = gps.date.day();          // Day of the month
-    timeinfo.tm_hour = gps.time.hour();
-    timeinfo.tm_min =  gps.time.minute();
-    timeinfo.tm_sec = gps.time.second();
-    t_of_day = mktime(&timeinfo);
+      rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(), gps.date.day(), gps.date.month(), gps.date.year());
+      rtc.setTime(rtc.getEpoch() +28800);
+      timeinfo = rtc.getTimeStruct();
     }
+  }
 }
-void drawCentreString(const String &buf, int x, int y)
+struct OldCords drawCentreString(const String &buf, int16_t x, int16_t y, OldCords old)
 {
-    int16_t x1, y1;
+    int16_t  x1, y1;
     uint16_t w, h;
-    display.getTextBounds(buf, x, y, &x1, &y1, &w, &h); //calc width of new string
-    Serial.printf("x:%d, y:%d, w:%d, h:%d", x1, y1, w, h);
-    Serial.print("\n");
+    display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h); //calc width of new string
+    if(!old.wo == 0 && !old.ho == 0){
+      display.fillRect(old.xo, old.yo , old.wo, old.ho, SSD1327_BLACK);
+      //display.drawRect(old.xo, old.yo , old.wo, old.ho, SSD1327_WHITE);
+    }
+    //Serial.printf("new x:%d, y:%d, w:%d, h:%d", x1, y1, w, h);
+    //Serial.print("\n");
     display.setCursor(x - w / 2, y);
     display.print(buf);
+    x = x - w / 2;
+    OldCords r = {x, y, w, h};
+    return r;
+}
+struct OldCords printlnnclearoldtext(Adafruit_SSD1327 &displayd, const char *text,uint16_t bg, OldCords old)
+{
+  uint16_t w, h;
+  OldCords r;
+  int16_t x1, y1,x,y;
+  x1 = displayd.getCursorX();
+  y1 = displayd.getCursorY();
+  r.xo = x1;
+  r.yo = y1;
+  displayd.getTextBounds(text, 0, 0, &x, &y, &w, &h);
+  r.wo = w;
+  r.ho = h;
+  if(!old.wo == 0 && !old.ho == 0){
+    displayd.fillRect(old.xo, old.yo , old.wo, old.ho, bg);
+    //displayd.drawRect(old.xo, old.yo , old.wo, old.ho, SSD1327_WHITE);
+  }
+  displayd.setCursor(x1, y1);
+  displayd.println(text);
+  return r;
 }
