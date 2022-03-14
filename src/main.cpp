@@ -270,8 +270,8 @@ void loop() {
       }
       }
       else if (SDcard_mounted){
-      //SD_MMC.end();
-      //SDcard_mounted = false;
+      SD_MMC.end();
+      SDcard_mounted = false;
     }
     #endif
   }
@@ -532,13 +532,15 @@ void displayOLED(int modes){
     display.setTextSize(1);
     display.setTextColor(SSD1327_WHITE, SSD1327_BLACK);
     display.println("Settings:");
-    display.print("SDcard Status:");
+    display.drawLine(0,10,127,10,SSD1327_WHITE);
+    display.print("SDcard:");
     if(!SDcard_mounted){
       display.println("Not Mounted");
     }
     else{
       display.println("Mounted");
     }
+    display.print(" EnableOBDRPM:");
   }
 }
 #ifdef LOG_to_SD
@@ -556,9 +558,8 @@ void loggingtoSD(){
   Serial.println(gps.speed.kmph());
   Serial.println(gps.location.lat());
   Serial.println(gps.location.lng());
-  dtostrf (gps.location.lat(), 14, 7, buffer[6]);
-  dtostrf (gps.location.lng(), 14, 7, buffer[7]);
-  
+  dtostrf (gps.location.lat(), 14, 10, buffer[6]);
+  dtostrf (gps.location.lng(), 14, 10, buffer[7]);
   //char currenttime[100];
   //sprintf(currenttime, "%d", esp_timer_get_time()/1000000);
   //strcat(message, currenttime);
